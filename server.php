@@ -112,24 +112,18 @@ function streamOllama($response, string $model, array $messages): void
             while (($pos = strpos($buffer, "\n")) !== false) {
                 $line = substr($buffer, 0, $pos);
                 $buffer = substr($buffer, $pos + 1);
-                
+
                 $line = trim($line);
-                if (strpos($line, 'data: ') === 0) {
-                    $json = substr($line, 6);
-                    if ($json === '[DONE]') {
-                        $response->write("data: [DONE]\n\n");
-                        $response->end();
-                        return -1;
-                    }
-                    
-                    $data = json_decode($json, true);
-                    if ($data && isset($data['message']['content'])) {
-                        $response->write("data: " . json_encode([
-                            'type' => 'content',
-                            'content' => $data['message']['content'],
-                        ]) . "\n\n");
-                    }
+                var_dump($line);
+
+                $data = json_decode($line, true);
+                if ($data && isset($data['message']['content'])) {
+                    $response->write("data: " . json_encode([
+                        'type' => 'content',
+                        'content' => $data['message']['content'],
+                    ]) . "\n\n");
                 }
+                
             }
             return strlen($chunk);
         },
@@ -180,21 +174,12 @@ function streamVLLM($response, string $model, array $messages): void
                 $buffer = substr($buffer, $pos + 1);
                 
                 $line = trim($line);
-                if (!empty($line) && strpos($line, 'data: ') === 0) {
-                    $json = substr($line, 6);
-                    if ($json === '[DONE]') {
-                        $response->write("data: [DONE]\n\n");
-                        $response->end();
-                        return -1;
-                    }
-                    
-                    $data = json_decode($json, true);
-                    if ($data && isset($data['choices'][0]['text'])) {
-                        $response->write("data: " . json_encode([
-                            'type' => 'content',
-                            'content' => $data['choices'][0]['text'],
-                        ]) . "\n\n");
-                    }
+                $data = json_decode($line, true);
+                if ($data && isset($data['choices'][0]['text'])) {
+                    $response->write("data: " . json_encode([
+                        'type' => 'content',
+                        'content' => $data['choices'][0]['text'],
+                    ]) . "\n\n");
                 }
             }
             return strlen($chunk);
