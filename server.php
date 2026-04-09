@@ -1,161 +1,72 @@
 <?php
 /**
- * AI Gateway - Ollama & vLLM 流式代理 (纯 PHP，无协程依赖)
+ * AI Gateway - Ollama & vLLM 流式代理 (Swoole 版本)
  */
 
-// 配置
 define('OLLAMA_URL', getenv('OLLAMA_URL') ?: 'http://localhost:11434');
 define('VLLM_URL', getenv('VLLM_URL') ?: 'http://localhost:8000');
 define('PORT', (int)(getenv('PORT') ?: 9501));
-
-// 错误处理
-set_error_handler(function($severity, $message, $file, $line) {
-    error_log("Error: $message at $file:$line");
-});
 
 // 日志
 if (!is_dir(__DIR__ . '/logs')) {
     mkdir(__DIR__ . '/logs', 0755, true);
 }
 
-$logFile = __DIR__ . '/logs/server.log';
+$http = new Swoole\Http\Server('0.0.0.0', PORT);
 
-function logMsg(string $msg): void {
-    global $logFile;
-    file_put_contents($logFile, date('Y-m-d H:i:s') . " $msg\n", FILE_APPEND);
-}
+$http->set([
+    'worker_num' => 1,
+    'daemonize' => false,
+    'log_file' => __DIR__ . '/logs/server.log',
+    'enable_coroutine' => false,  // 禁用协程，使用同步模式
+]);
 
-logMsg("Server starting on port " . PORT);
-
-// 创建 TCP 服务器
-$server = stream_socket_server("tcp://0.0.0.0:" . PORT, $errno, $errstr);
-
-if (!$server) {
-    die("创建服务器失败: $errstr ($errno)\n");
-}
-
-logMsg("Server started on http://localhost:" . PORT);
-
-echo "🚀 AI Gateway 启动成功\n";
-echo "📍 访问: http://localhost:" . PORT . "\n";
-echo "按 Ctrl+C 停止\n\n";
-
-while ($client = @stream_socket_accept($server, 300)) {
-    handleClient($client);
-}
-
-function handleClient($client): void {
-    // 读取请求行
-    $requestLine = fgets($client);
-    if (!$requestLine) {
-        fclose($client);
+$http->on('Request', function ($request, $response) {
+    $path = $request->server['request_uri'] ?? '/';
+    $method = $request->server['request_method'] ?? 'GET';
+    
+    $response->header('Access-Control-Allow-Origin', '*');
+    $response->header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    $response->header('Access-Control-Allow-Headers', 'Content-Type');
+    
+    if ($method === 'OPTIONS') {
+        $response->status(204);
+        $response->end();
         return;
     }
     
-    // 解析请求
-    preg_match('/^(\w+)\s+(\S+)\s+HTTP/', $requestLine, $matches);
-    $method = $matches[1] ?? 'GET';
-    $path = $matches[2] ?? '/';
-    
-    // 读取请求头
-    $headers = [];
-    $contentLength = 0;
-    while (($line = fgets($client)) !== false) {
-        $line = trim($line);
-        if ($line === '') break;
-        if (preg_match('/^Content-Length:\s*(\d+)/i', $line, $m)) {
-            $contentLength = (int)$m[1];
-        }
-        if (preg_match('/^([^:]+):\s*(.+)/', $line, $m)) {
-            $headers[strtolower($m[1])] = $m[2];
-        }
-    }
-    
-    // 读取请求体
-    $body = '';
-    if ($contentLength > 0) {
-        $body = fread($client, $contentLength);
-    }
-    
-    // CORS
-    $cors = "Access-Control-Allow-Origin: *\r\n"
-          . "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-          . "Access-Control-Allow-Headers: Content-Type\r\n";
-    
-    // 处理请求
     try {
-        if ($method === 'OPTIONS') {
-            sendResponse($client, 204, $cors, '');
-            fclose($client);
-            return;
-        }
-        
         switch ($path) {
+            case '/api/chat/stream':
+                handleStreamChat($request, $response);
+                break;
+            case '/api/models':
+                handleModels($request, $response);
+                break;
+            case '/health':
+                $response->end(json_encode(['status' => 'ok']));
+                break;
             case '/':
             case '/index.html':
-                serveIndex($client, $cors);
+                serveIndex($response);
                 break;
-                
-            case '/api/chat/stream':
-                handleStreamChat($client, $cors, $body);
-                break;
-                
-            case '/api/models':
-                handleModels($client, $cors, $path);
-                break;
-                
-            case '/health':
-                sendResponse($client, 200, $cors, json_encode(['status' => 'ok']));
-                break;
-                
             default:
-                sendResponse($client, 404, $cors, 'Not Found');
+                $response->status(404);
+                $response->end('Not Found');
         }
     } catch (Throwable $e) {
-        logMsg("Error: " . $e->getMessage());
-        sendResponse($client, 500, $cors, json_encode(['error' => $e->getMessage()]));
+        $response->status(500);
+        $response->end(json_encode(['error' => $e->getMessage()]));
     }
-    
-    fclose($client);
-}
+});
 
-function sendResponse($client, int $code, string $cors, string $body, array $extraHeaders = []): void {
-    $codes = [200 => 'OK', 204 => 'No Content', 400 => 'Bad Request', 404 => 'Not Found', 500 => 'Internal Server Error'];
-    
-    $headers = "HTTP/1.1 $code {$codes[$code]}\r\n";
-    $headers .= "Content-Type: application/json\r\n";
-    $headers .= "Content-Length: " . strlen($body) . "\r\n";
-    $headers .= "Connection: close\r\n";
-    $headers .= $cors;
-    
-    foreach ($extraHeaders as $k => $v) {
-        $headers .= "$k: $v\r\n";
-    }
-    
-    $headers .= "\r\n";
-    
-    fwrite($client, $headers . $body);
-}
-
-function sendSSEHeaders($client, string $cors): void {
-    $headers = "HTTP/1.1 200 OK\r\n";
-    $headers .= "Content-Type: text/event-stream\r\n";
-    $headers .= "Cache-Control: no-cache\r\n";
-    $headers .= "Connection: close\r\n";
-    $headers .= $cors;
-    $headers .= "\r\n";
-    fwrite($client, $headers);
-}
-
-/**
- * 流式聊天
- */
-function handleStreamChat($client, string $cors, string $body): void
+function handleStreamChat($request, $response): void
 {
-    $data = json_decode($body, true);
+    $data = json_decode($request->getContent(), true);
     
     if (!$data || !isset($data['messages'])) {
-        sendResponse($client, 400, $cors, json_encode(['error' => 'Invalid request']));
+        $response->status(400);
+        $response->end(json_encode(['error' => 'Invalid request']));
         return;
     }
     
@@ -163,19 +74,18 @@ function handleStreamChat($client, string $cors, string $body): void
     $model = $data['model'] ?? 'llama3.2';
     $messages = $data['messages'];
     
-    logMsg("Stream request: provider=$provider, model=$model");
+    $response->header('Content-Type', 'text/event-stream');
+    $response->header('Cache-Control', 'no-cache');
+    $response->header('X-Accel-Buffering', 'no');
     
     if ($provider === 'ollama') {
-        streamOllama($client, $cors, $model, $messages);
+        streamOllama($response, $model, $messages);
     } else {
-        streamVLLM($client, $cors, $model, $messages);
+        streamVLLM($response, $model, $messages);
     }
 }
 
-/**
- * Ollama 流式输出
- */
-function streamOllama($client, string $cors, string $model, array $messages): void
+function streamOllama($response, string $model, array $messages): void
 {
     $ollamaMessages = array_map(fn($m) => [
         'role' => $m['role'] ?? 'user',
@@ -188,85 +98,58 @@ function streamOllama($client, string $cors, string $model, array $messages): vo
         'stream' => true,
     ]);
     
-    // 解析 Ollama URL
-    $parts = parse_url(OLLAMA_URL);
-    $host = $parts['host'] ?? '127.0.0.1';
-    $port = $parts['port'] ?? 80;
-    $path = '/api/chat';
-    
-    logMsg("Connecting to Ollama: $host:$port");
-    
-    // 创建流式请求
-    $ctx = stream_context_create([
-        'http' => [
-            'method' => 'POST',
-            'header' => "Content-Type: application/json\r\n",
-            'content' => $postData,
-            'timeout' => 300,
-            'ignore_errors' => true,
-        ]
-    ]);
-    
-    $fp = @fopen("http://{$host}:{$port}{$path}", 'r', false, $ctx);
-    
-    if (!$fp) {
-        logMsg("Cannot connect to Ollama at $host:$port");
-        sendSSEHeaders($client, $cors);
-        fwrite($client, "data: " . json_encode(['error' => 'Cannot connect to Ollama']) . "\n\n");
-        fwrite($client, "data: [DONE]\n\n");
-        fflush($client);
-        return;
-    }
-    
-    sendSSEHeaders($client, $cors);
-    fflush($client);
-    
-    $buffer = '';
-    
-    // 读取流式响应
-    while (!feof($fp)) {
-        $chunk = fread($fp, 8192);
-        if ($chunk === false) break;
-        
-        $buffer .= $chunk;
-        
-        // 处理每一行
-        while (($pos = strpos($buffer, "\n")) !== false) {
-            $line = substr($buffer, 0, $pos);
-            $buffer = substr($buffer, $pos + 1);
+    // 使用 curl 同步请求
+    $ch = curl_init(OLLAMA_URL . '/api/chat');
+    curl_setopt_array($ch, [
+        CURLOPT_POST => true,
+        CURLOPT_POSTFIELDS => $postData,
+        CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
+        CURLOPT_RETURNTRANSFER => false,
+        CURLOPT_WRITEFUNCTION => function ($ch, $chunk) use ($response) {
+            static $buffer = '';
+            $buffer .= $chunk;
             
-            $line = trim($line);
-            if (strpos($line, 'data: ') === 0) {
-                $json = substr($line, 6);
+            while (($pos = strpos($buffer, "\n")) !== false) {
+                $line = substr($buffer, 0, $pos);
+                $buffer = substr($buffer, $pos + 1);
                 
-                if ($json === '[DONE]') {
-                    fwrite($client, "data: [DONE]\n\n");
-                    fflush($client);
-                    fclose($fp);
-                    return;
-                }
-                
-                $data = json_decode($json, true);
-                if ($data && isset($data['message']['content'])) {
-                    $content = $data['message']['content'];
-                    fwrite($client, "data: " . json_encode(['type' => 'content', 'content' => $content]) . "\n\n");
-                    fflush($client);
+                $line = trim($line);
+                if (strpos($line, 'data: ') === 0) {
+                    $json = substr($line, 6);
+                    if ($json === '[DONE]') {
+                        $response->write("data: [DONE]\n\n");
+                        $response->end();
+                        return -1;
+                    }
+                    
+                    $data = json_decode($json, true);
+                    if ($data && isset($data['message']['content'])) {
+                        $response->write("data: " . json_encode([
+                            'type' => 'content',
+                            'content' => $data['message']['content'],
+                        ]) . "\n\n");
+                    }
                 }
             }
-        }
+            return strlen($chunk);
+        },
+        CURLOPT_TIMEOUT => 300,
+    ]);
+    
+    $result = curl_exec($ch);
+    
+    if ($result === false) {
+        $error = curl_error($ch);
+        $response->write("data: " . json_encode(['error' => $error]) . "\n\n");
     }
     
-    fwrite($client, "data: [DONE]\n\n");
-    fflush($client);
-    fclose($fp);
+    $response->write("data: [DONE]\n\n");
+    $response->end();
+    curl_close($ch);
 }
 
-/**
- * vLLM 流式输出
- */
-function streamVLLM($client, string $cors, string $model, array $messages): void
+function streamVLLM($response, string $model, array $messages): void
 {
-    // 合并消息
     $prompt = '';
     foreach ($messages as $msg) {
         $role = $msg['role'] ?? 'user';
@@ -275,10 +158,6 @@ function streamVLLM($client, string $cors, string $model, array $messages): void
     }
     $prompt .= "<|assistant|>\n";
     
-    $parts = parse_url(VLLM_URL);
-    $host = $parts['host'] ?? '127.0.0.1';
-    $port = $parts['port'] ?? 80;
-    
     $postData = json_encode([
         'model' => $model,
         'prompt' => $prompt,
@@ -286,99 +165,84 @@ function streamVLLM($client, string $cors, string $model, array $messages): void
         'max_tokens' => 4096,
     ]);
     
-    $ctx = stream_context_create([
-        'http' => [
-            'method' => 'POST',
-            'header' => "Content-Type: application/json\r\n",
-            'content' => $postData,
-            'timeout' => 300,
-            'ignore_errors' => true,
-        ]
-    ]);
-    
-    $fp = @fopen("http://{$host}:{$port}/v1/completions", 'r', false, $ctx);
-    
-    if (!$fp) {
-        logMsg("Cannot connect to vLLM at $host:$port");
-        sendSSEHeaders($client, $cors);
-        fwrite($client, "data: " . json_encode(['error' => 'Cannot connect to vLLM']) . "\n\n");
-        fwrite($client, "data: [DONE]\n\n");
-        fflush($client);
-        return;
-    }
-    
-    sendSSEHeaders($client, $cors);
-    fflush($client);
-    
-    $buffer = '';
-    
-    while (!feof($fp)) {
-        $chunk = fread($fp, 8192);
-        if ($chunk === false) break;
-        
-        $buffer .= $chunk;
-        
-        while (($pos = strpos($buffer, "\n")) !== false) {
-            $line = substr($buffer, 0, $pos);
-            $buffer = substr($buffer, $pos + 1);
+    $ch = curl_init(VLLM_URL . '/v1/completions');
+    curl_setopt_array($ch, [
+        CURLOPT_POST => true,
+        CURLOPT_POSTFIELDS => $postData,
+        CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
+        CURLOPT_RETURNTRANSFER => false,
+        CURLOPT_WRITEFUNCTION => function ($ch, $chunk) use ($response) {
+            static $buffer = '';
+            $buffer .= $chunk;
             
-            $line = trim($line);
-            if (!empty($line) && strpos($line, 'data: ') === 0) {
-                $json = substr($line, 6);
+            while (($pos = strpos($buffer, "\n")) !== false) {
+                $line = substr($buffer, 0, $pos);
+                $buffer = substr($buffer, $pos + 1);
                 
-                if ($json === '[DONE]') {
-                    fwrite($client, "data: [DONE]\n\n");
-                    fflush($client);
-                    fclose($fp);
-                    return;
-                }
-                
-                $data = json_decode($json, true);
-                if ($data && isset($data['choices'][0]['text'])) {
-                    $content = $data['choices'][0]['text'];
-                    fwrite($client, "data: " . json_encode(['type' => 'content', 'content' => $content]) . "\n\n");
-                    fflush($client);
+                $line = trim($line);
+                if (!empty($line) && strpos($line, 'data: ') === 0) {
+                    $json = substr($line, 6);
+                    if ($json === '[DONE]') {
+                        $response->write("data: [DONE]\n\n");
+                        $response->end();
+                        return -1;
+                    }
+                    
+                    $data = json_decode($json, true);
+                    if ($data && isset($data['choices'][0]['text'])) {
+                        $response->write("data: " . json_encode([
+                            'type' => 'content',
+                            'content' => $data['choices'][0]['text'],
+                        ]) . "\n\n");
+                    }
                 }
             }
-        }
+            return strlen($chunk);
+        },
+        CURLOPT_TIMEOUT => 300,
+    ]);
+    
+    $result = curl_exec($ch);
+    
+    if ($result === false) {
+        $response->write("data: " . json_encode(['error' => curl_error($ch)]) . "\n\n");
     }
     
-    fwrite($client, "data: [DONE]\n\n");
-    fflush($client);
-    fclose($fp);
+    $response->write("data: [DONE]\n\n");
+    $response->end();
+    curl_close($ch);
 }
 
-/**
- * 模型列表
- */
-function handleModels($client, string $cors, string $uri): void
+function handleModels($request, $response): void
 {
-    // 从 URI 解析查询参数
-    $query = parse_url($uri, PHP_URL_QUERY) ?: '';
-    parse_str($query, $params);
-    $provider = $params['provider'] ?? 'ollama';
-    
-    logMsg("Fetching models from: $provider");
+    $provider = $request->get['provider'] ?? 'ollama';
     
     if ($provider === 'ollama') {
-        $ctx = stream_context_create(['http' => ['timeout' => 5, 'ignore_errors' => true]]);
-        $result = @file_get_contents(OLLAMA_URL . '/api/tags', false, $ctx);
+        $result = httpGet(OLLAMA_URL . '/api/tags');
         $data = json_decode($result, true) ?? [];
         $models = array_map(fn($m) => ['name' => $m['name'], 'provider' => 'ollama'], $data['models'] ?? []);
     } else {
-        $ctx = stream_context_create(['http' => ['timeout' => 5, 'ignore_errors' => true]]);
-        $result = @file_get_contents(VLLM_URL . '/v1/models', false, $ctx);
+        $result = httpGet(VLLM_URL . '/v1/models');
         $data = json_decode($result, true) ?? [];
         $models = array_map(fn($m) => ['name' => $m['id'], 'provider' => 'vllm'], $data['data'] ?? []);
     }
     
-    sendResponse($client, 200, $cors, json_encode(['models' => $models]));
+    $response->end(json_encode(['models' => $models]));
 }
 
-/**
- * 前端页面
- */
-function serveIndex($client, string $cors): void
+function httpGet(string $url): string
+{
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT => 5,
+    ]);
+    $result = curl_exec($ch);
+    curl_close($ch);
+    return $result ?: '';
+}
+
+function serveIndex($response): void
 {
     $html = <<<'HTML'
 <!DOCTYPE html>
@@ -550,12 +414,12 @@ function serveIndex($client, string $cors): void
 </html>
 HTML;
     
-    $headers = "HTTP/1.1 200 OK\r\n";
-    $headers .= "Content-Type: text/html; charset=utf-8\r\n";
-    $headers .= "Content-Length: " . strlen($html) . "\r\n";
-    $headers .= "Connection: close\r\n";
-    $headers .= "Access-Control-Allow-Origin: *\r\n";
-    $headers .= "\r\n";
-    
-    fwrite($client, $headers . $html);
+    $response->header('Content-Type', 'text/html; charset=utf-8');
+    $response->end($html);
 }
+
+echo "🚀 AI Gateway (Swoole) 启动中...\n";
+echo "📍 访问: http://localhost:" . PORT . "\n";
+echo "📦 支持: Ollama | vLLM\n\n";
+
+$http->start();
