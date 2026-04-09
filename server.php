@@ -124,7 +124,6 @@ function streamOllamaWithTools($response, $model, $messages, $useTools)
         $role = isset($m['role']) ? $m['role'] : 'user';
         $content = isset($m['content']) ? $m['content'] : '';
         
-        // 处理 tool 类型的消息
         if ($role === 'tool' && isset($m['name'])) {
             $ollamaMessages[] = [
                 'role' => 'tool',
@@ -147,10 +146,11 @@ function streamOllamaWithTools($response, $model, $messages, $useTools)
     $tools = $useTools ? $GLOBALS['tools'] : [];
     $maxIterations = 10;
     $iteration = 0;
+    $usedTools = []; // 记录使用的工具
     
     while ($iteration < $maxIterations) {
         $iteration++;
-        echo '.';
+        
         $postData = json_encode([
             'model' => $model,
             'messages' => $ollamaMessages,
@@ -183,28 +183,30 @@ function streamOllamaWithTools($response, $model, $messages, $useTools)
         }
         curl_close($ch);
         
-        // 解析 SSE 数据
+        // 解析并流式输出 SSE 数据
         $lines = explode("\n", $buffer);
         $hasToolCall = false;
-        $finalContent = '';
+        $fullContent = '';
         
         foreach ($lines as $line) {
 
+            $json = substr($line, 6);
+            if ($json === '[DONE]' || $json === '') continue;
+            
             $data = json_decode(trim($line), true);
             if (!$data) continue;
             
             if (isset($data['message']['tool_calls']) && !empty($data['message']['tool_calls'])) {
-                // 有工具调用
                 $hasToolCall = true;
                 $toolCalls = $data['message']['tool_calls'];
                 
-                // 发送工具调用事件
+                // 流式发送工具调用
                 $response->write("event: tool_call\ndata: " . json_encode([
                     'type' => 'tool_call',
                     'calls' => $toolCalls
                 ]) . "\n\n");
                 
-                // 执行每个工具
+                // 执行工具
                 foreach ($toolCalls as $call) {
                     $func = isset($call['function']) ? $call['function'] : $call;
                     $name = $func['name'];
@@ -214,15 +216,15 @@ function streamOllamaWithTools($response, $model, $messages, $useTools)
                     }
                     
                     $result = executeTool($name, $args);
+                    $usedTools[] = ['name' => $name, 'args' => $args, 'result' => $result];
                     
-                    // 发送工具结果事件
+                    // 流式发送工具结果
                     $response->write("event: tool_result\ndata: " . json_encode([
                         'type' => 'tool_result',
                         'name' => $name,
                         'result' => $result
                     ]) . "\n\n");
                     
-                    // 添加助手消息和工具结果到历史
                     $ollamaMessages[] = [
                         'role' => 'assistant',
                         'content' => '',
@@ -237,30 +239,42 @@ function streamOllamaWithTools($response, $model, $messages, $useTools)
                 
                 break;
                 
-            } elseif (isset($data['message']['content']) && $data['message']['content'] !== '') {
-                // 直接输出文本（模型不支持工具或不需要调用工具）
+            } elseif (isset($data['message']['content'])) {
                 $content = $data['message']['content'];
-                $response->write("event: content\ndata: " . json_encode([
-                    'type' => 'content',
-                    'content' => $content
-                ]) . "\n\n");
-                $finalContent = $content;
-            } elseif(isset($data['error'])) {
-                $response->write("event: content\ndata: " . json_encode([
+                if ($content !== '') {
+                    $fullContent .= $content;
+                    // 流式输出每个内容片段
+                    $response->write("event: content\ndata: " . json_encode([
+                        'type' => 'content',
+                        'content' => $content
+                    ]) . "\n\n");
+                }
+            } elseif (isset($data['error'])) {
+                $response->write("event: error\ndata: " . json_encode([
                     'type' => 'content',
                     'content' => $data['error']
                 ]) . "\n\n");
             }
         }
         
-        // 如果没有工具调用，说明是最终回复
         if (!$hasToolCall) {
-            if ($finalContent) {
-                $ollamaMessages[] = [
-                    'role' => 'assistant',
-                    'content' => $finalContent
-                ];
+            // 最终回复，添加使用的工具说明
+            if (!empty($usedTools)) {
+                $toolSummary = "\n\n" . str_repeat("─", 30) . "\n";
+                $toolSummary .= "📌 使用工具: ";
+                $toolNames = array_column($usedTools, 'name');
+                $toolSummary .= implode(", ", $toolNames);
+                
+                $response->write("event: content\ndata: " . json_encode([
+                    'type' => 'content',
+                    'content' => $toolSummary
+                ]) . "\n\n");
             }
+            
+            $ollamaMessages[] = [
+                'role' => 'assistant',
+                'content' => $fullContent
+            ];
             break;
         }
     }
