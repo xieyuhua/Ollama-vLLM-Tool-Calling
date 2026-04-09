@@ -548,7 +548,7 @@ function serveIndex($response, $tools)
                 </select>
                 <select id="model"><option>Loading...</option></select>
                 <button onclick="loadModels()">Refresh</button>
-                <button class="tool-btn" onclick="toggleTools()">Tools ' . $toolsEnabled . '</button>
+                <button id="toolsToggleBtn" class="tool-btn" onclick="toggleTools()">Tools: ON</button>
             </div>
         </header>
         
@@ -599,6 +599,11 @@ function serveIndex($response, $tools)
 
         function toggleTools() {
             useTools = !useTools;
+            var btn = document.getElementById("toolsToggleBtn");
+            btn.textContent = "Tools: " + (useTools ? "ON" : "OFF");
+            btn.style.background = useTools 
+                ? "linear-gradient(135deg, #22c55e, #16a34a)" 
+                : "linear-gradient(135deg, #666, #444)";
             status.textContent = "Tools " + (useTools ? "enabled" : "disabled");
         }
 
