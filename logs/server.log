@@ -1,0 +1,6 @@
+2026-04-09 05:48:52 Server starting on port 9501
+2026-04-09 05:48:52 Server started on http://localhost:9501
+2026-04-09 05:48:52 Stream request: provider=ollama, model=qwen2.5:0.5b
+2026-04-09 05:48:52 Connecting to Ollama: localhost:11434
+2026-04-09 05:51:09 Server starting on port 9501
+2026-04-09 05:51:09 Server started on http://localhost:9501
