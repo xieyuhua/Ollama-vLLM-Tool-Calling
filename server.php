@@ -257,6 +257,8 @@ function serveIndex($response): void
         .loading { display: inline-block; width: 18px; height: 18px; border: 2px solid #fff; border-top-color: transparent; border-radius: 50%; animation: spin 0.8s linear infinite; }
         @keyframes spin { to { transform: rotate(360deg); } }
         .status { font-size: 12px; color: #888; margin-top: 10px; min-height: 18px; }
+        .think-box { background: #252535; border-left: 3px solid #f59e0b; padding: 8px 12px; margin: 8px 0; border-radius: 0 6px 6px 0; font-size: 13px; color: #ccc; }
+        .think-label { display: block; font-size: 11px; color: #f59e0b; margin-bottom: 4px; font-weight: bold; }
     </style>
 </head>
 <body>
@@ -324,10 +326,30 @@ function serveIndex($response): void
         function addMsg(role, content) {
             const div = document.createElement('div');
             div.className = 'message ' + role;
-            div.innerHTML = content.replace(/\n/g, '<br>');
+            
+            // 处理 think 标签
+            if (content.includes('<think>')) {
+                const parts = content.split(/(<think>[\s\S]*?<\/think>)/);
+                div.innerHTML = parts.map(part => {
+                    if (part.startsWith('<think>')) {
+                        const thinkContent = part.replace(/<\/?think>/g, '');
+                        return '<div class="think-box"><span class="think-label">💭 思考中...</span>' + escapeHtml(thinkContent) + '</div>';
+                    }
+                    return escapeHtml(part);
+                }).join('');
+            } else {
+                div.innerHTML = escapeHtml(content).replace(/\n/g, '<br>');
+            }
+            
             chatBox.appendChild(div);
             chatBox.scrollTop = chatBox.scrollHeight;
             return div;
+        }
+        
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
         }
 
         async function send() {
@@ -375,7 +397,19 @@ function serveIndex($response): void
                                 const p = JSON.parse(data);
                                 if (p.content) {
                                     full += p.content;
-                                    aiDiv.innerHTML = full.replace(/\n/g, '<br>');
+                                    // 更新显示，处理 think 标签
+                                    if (full.includes('<think>')) {
+                                        const parts = full.split(/(<think>[\s\S]*?<\/think>)/);
+                                        aiDiv.innerHTML = parts.map(part => {
+                                            if (part.startsWith('<think>')) {
+                                                const thinkContent = part.replace(/<\/?think>/g, '');
+                                                return '<div class="think-box"><span class="think-label">💭 思考中...</span>' + escapeHtml(thinkContent) + '</div>';
+                                            }
+                                            return escapeHtml(part).replace(/\n/g, '<br>');
+                                        }).join('');
+                                    } else {
+                                        aiDiv.innerHTML = escapeHtml(full).replace(/\n/g, '<br>');
+                                    }
                                     chatBox.scrollTop = chatBox.scrollHeight;
                                 }
                             } catch {}
