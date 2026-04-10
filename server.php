@@ -1,12 +1,14 @@
 <?php
 /**
- * AI Gateway - Ollama & vLLM 流式代理 (支持 Tool Calling)
+ * AI Gateway - Ollama & vLLM 流式代理 (支持 Tool Calling + Qdrant RAG)
  * PHP 7.4+
  */
 
 define('OLLAMA_URL', getenv('OLLAMA_URL') ?: 'http://localhost:11434');
 define('VLLM_URL', getenv('VLLM_URL') ?: 'http://localhost:8000');
 define('PORT', (int)(getenv('PORT') ?: 9501));
+define('USE_QDRANT', getenv('USE_QDRANT') !== 'false'); // 默认启用 Qdrant 检索
+define('MAX_RETRIEVE_TOOLS', 3); // 最多检索的工具数量
 
 // 日志目录
 if (!is_dir(__DIR__ . '/logs')) {
@@ -25,6 +27,20 @@ $http->set([
 // 加载工具
 require_once __DIR__ . '/tools/loader.php';
 $tools = loadTools();
+
+// 加载 Qdrant 向量库 (如果可用)
+$qdrantAvailable = false;
+if (USE_QDRANT) {
+    try {
+        require_once __DIR__ . '/tools/qdrant.php';
+        $qdrantAvailable = true;
+        // 初始化向量索引
+        $store = getFunctionVectorStore();
+        $store->initCollection();
+    } catch (Exception $e) {
+        error_log("Qdrant init failed: " . $e->getMessage());
+    }
+}
 
 $http->on('Request', function ($request, $response) use ($tools) {
     $path = $request->server['request_uri'] ?? '/';
@@ -58,8 +74,19 @@ $http->on('Request', function ($request, $response) use ($tools) {
             case '/api/models':
                 handleModels($request, $response);
                 break;
+            case '/api/qdrant/index':
+                // 索引所有工具到 Qdrant
+                handleQdrantIndex($request, $response, $tools);
+                break;
+            case '/api/qdrant/search':
+                // 测试检索
+                handleQdrantSearch($request, $response);
+                break;
             case '/health':
-                $response->end(json_encode(['status' => 'ok']));
+                $response->end(json_encode([
+                    'status' => 'ok',
+                    'qdrant' => $qdrantAvailable ? 'connected' : 'disabled'
+                ]));
                 break;
             case '/':
             case '/index.html':
@@ -93,6 +120,8 @@ function handleExecute($request, $response)
 
 function handleStreamChat($request, $response)
 {
+    global $qdrantAvailable, $tools;
+    
     $data = json_decode($request->getContent(), true);
     
     if (!$data || !isset($data['messages'])) {
@@ -106,19 +135,49 @@ function handleStreamChat($request, $response)
     $messages = $data['messages'];
     $streamTools = isset($data['tools']) ? $data['tools'] : true;
     
+    // 如果启用了 Qdrant 且可用，从用户消息中检索相关函数
+    $selectedTools = $tools;
+    if ($qdrantAvailable && $streamTools) {
+        // 获取用户最新的消息
+        $userQuery = '';
+        for ($i = count($messages) - 1; $i >= 0; $i--) {
+            if (isset($messages[$i]['role']) && $messages[$i]['role'] === 'user') {
+                $userQuery = $messages[$i]['content'];
+                break;
+            }
+        }
+        
+        if ($userQuery) {
+            try {
+                $retrievedTools = retrieveRelevantFunctions($userQuery, MAX_RETRIEVE_TOOLS);
+                if (!empty($retrievedTools)) {
+                    $selectedTools = array_column($retrievedTools, 'definition');
+                    // 发送检索信息给前端
+                    $retrievedNames = implode(', ', array_column($retrievedTools, 'name'));
+                    error_log("Qdrant retrieved: {$retrievedNames} for query: " . substr($userQuery, 0, 100));
+                }
+            } catch (Exception $e) {
+                error_log("Qdrant retrieve failed: " . $e->getMessage());
+            }
+        }
+    }
+    
     $response->header('Content-Type', 'text/event-stream');
     $response->header('Cache-Control', 'no-cache');
     $response->header('X-Accel-Buffering', 'no');
     
     if ($provider === 'ollama') {
-        streamOllamaWithTools($response, $model, $messages, $streamTools);
+        streamOllamaWithTools($response, $model, $messages, $selectedTools, $tools);
     } else {
-        streamVLLMWithTools($response, $model, $messages, $streamTools);
+        streamVLLMWithTools($response, $model, $messages, $selectedTools, $tools);
     }
 }
 
-function streamOllamaWithTools($response, $model, $messages, $useTools)
+function streamOllamaWithTools($response, $model, $messages, $selectedTools, $allTools)
 {
+    // 如果有检索到的工具，使用检索结果；否则使用所有工具
+    $useTools = !empty($selectedTools) ? $selectedTools : $allTools;
+    
     $ollamaMessages = [];
     foreach ($messages as $m) {
         $role = isset($m['role']) ? $m['role'] : 'user';
@@ -143,7 +202,7 @@ function streamOllamaWithTools($response, $model, $messages, $useTools)
         }
     }
     
-    $tools = $useTools ? $GLOBALS['tools'] : [];
+    $activeTools = is_array($useTools) ? $useTools : [];
     $maxIterations = 10;
     $iteration = 0;
     $usedTools = [];
@@ -157,7 +216,7 @@ function streamOllamaWithTools($response, $model, $messages, $useTools)
             'model' => $model,
             'messages' => $ollamaMessages,
             'stream' => true,
-            'tools' => $tools,
+            'tools' => $activeTools,
         ]);
         
         $ch = curl_init(OLLAMA_URL . '/api/chat');
@@ -168,7 +227,7 @@ function streamOllamaWithTools($response, $model, $messages, $useTools)
             CURLOPT_POSTFIELDS => $postData,
             CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
             CURLOPT_RETURNTRANSFER => false,
-            CURLOPT_WRITEFUNCTION => function ($ch, $chunk) use ($response, &$lineBuffer, &$ollamaMessages, &$usedTools, &$fullContent, &$hasToolCall, $iteration, $maxIterations, $tools, $model) {
+            CURLOPT_WRITEFUNCTION => function ($ch, $chunk) use ($response, &$lineBuffer, &$ollamaMessages, &$usedTools, &$fullContent, &$hasToolCall, $iteration, $maxIterations, $activeTools, $model) {
                 // 实时处理每个字符
                 for ($i = 0; $i < strlen($chunk); $i++) {
                     $char = $chunk[$i];
@@ -187,6 +246,15 @@ function streamOllamaWithTools($response, $model, $messages, $useTools)
                         if (isset($data['message']['tool_calls']) && !empty($data['message']['tool_calls'])) {
                             $hasToolCall = true; // 标记有工具调用
                             $toolCalls = $data['message']['tool_calls'];
+                            
+                            // 如果之前有累积的 content，先保存为 assistant 消息
+                            if (!empty($fullContent)) {
+                                $ollamaMessages[] = [
+                                    'role' => 'assistant',
+                                    'content' => $fullContent
+                                ];
+                                $fullContent = ''; // 清空，准备接收后续内容
+                            }
                             
                             $response->write("event: tool_call\ndata: " . json_encode([
                                 'type' => 'tool_call',
@@ -298,8 +366,11 @@ function streamOllamaWithTools($response, $model, $messages, $useTools)
     $response->end();
 }
 
-function streamVLLMWithTools($response, $model, $messages, $useTools)
+function streamVLLMWithTools($response, $model, $messages, $selectedTools, $allTools)
 {
+    // 如果有检索到的工具，使用检索结果；否则使用所有工具
+    $useTools = !empty($selectedTools) ? $selectedTools : $allTools;
+    
     $prompt = '';
     foreach ($messages as $msg) {
         $role = isset($msg['role']) ? $msg['role'] : 'user';
@@ -325,7 +396,7 @@ function streamVLLMWithTools($response, $model, $messages, $useTools)
         'prompt' => $prompt,
         'stream' => true,
         'max_tokens' => 4096,
-        'tools' => $useTools ? $GLOBALS['tools'] : [],
+        'tools' => is_array($useTools) ? $useTools : [],
     ]);
     
     $ch = curl_init(VLLM_URL . '/v1/completions');
@@ -507,16 +578,80 @@ function httpGet($url)
     return $result ?: '';
 }
 
+
+/**
+ * Qdrant 向量索引处理
+ */
+function handleQdrantIndex($request, $response, $tools)
+{
+    global $qdrantAvailable;
+    
+    $response->header('Content-Type', 'application/json');
+    
+    if (!$qdrantAvailable) {
+        $response->end(json_encode(['success' => false, 'error' => 'Qdrant is not available']));
+        return;
+    }
+    
+    try {
+        $store = getFunctionVectorStore();
+        $result = $store->indexFunctions($tools);
+        $response->end(json_encode([
+            'success' => true,
+            'message' => 'Indexed ' . count($tools) . ' tools',
+            'collection' => QDRANT_COLLECTION
+        ]));
+    } catch (Exception $e) {
+        $response->end(json_encode(['success' => false, 'error' => $e->getMessage()]));
+    }
+}
+
+/**
+ * Qdrant 检索测试
+ */
+function handleQdrantSearch($request, $response)
+{
+    global $qdrantAvailable;
+    
+    $data = json_decode($request->getContent(), true);
+    $query = isset($data['query']) ? $data['query'] : '';
+    $limit = isset($data['limit']) ? (int)$data['limit'] : 3;
+    
+    $response->header('Content-Type', 'application/json');
+    
+    if (!$qdrantAvailable) {
+        $response->end(json_encode(['success' => false, 'error' => 'Qdrant is not available']));
+        return;
+    }
+    
+    if (!$query) {
+        $response->end(json_encode(['success' => false, 'error' => 'Query is required']));
+        return;
+    }
+    
+    try {
+        $results = retrieveRelevantFunctions($query, $limit);
+        $response->end(json_encode([
+            'success' => true,
+            'query' => $query,
+            'results' => $results
+        ]));
+    } catch (Exception $e) {
+        $response->end(json_encode(['success' => false, 'error' => $e->getMessage()]));
+    }
+}
+
 function serveIndex($response, $tools)
 {
-    $toolsJson = json_encode($tools);
+    // 使用 JSON_HEX_TAG 转义 < 和 >，防止 </script> 等破坏 HTML
+    $toolsJson = json_encode($tools, JSON_UNESCAPED_UNICODE | JSON_HEX_TAG);
     $toolsEnabled = count($tools) > 0 ? 'ON' : 'OFF';
     $toolsList = [];
     foreach ($tools as $t) {
-        $toolsList[] = '<li class="tool-item" data-name="' . $t['function']['name'] . '">' 
+        $toolsList[] = '<li class="tool-item" data-name="' . htmlspecialchars($t['function']['name'], ENT_QUOTES) . '">' 
             . '<span class="tool-icon">&#x1F527;</span>' 
-            . '<span class="tool-name">' . $t['function']['name'] . '</span>'
-            . '<span class="tool-desc">' . $t['function']['description'] . '</span>'
+            . '<span class="tool-name">' . htmlspecialchars($t['function']['name'], ENT_QUOTES) . '</span>'
+            . '<span class="tool-desc">' . htmlspecialchars($t['function']['description'], ENT_QUOTES) . '</span>'
             . '</li>';
     }
     $toolsHtml = '<ul class="tools-list">' . implode('', $toolsList) . '</ul>';
@@ -529,41 +664,82 @@ function serveIndex($response, $tools)
     <title>AI Gateway - Tool Calling</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
-        body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #0f0f1a; color: #fff; min-height: 100vh; }
-        .container { max-width: 900px; margin: 0 auto; padding: 20px; }
-        header { display: flex; justify-content: space-between; align-items: center; padding: 20px 0; border-bottom: 1px solid #333; margin-bottom: 20px; }
-        h1 { font-size: 24px; background: linear-gradient(135deg, #667eea, #764ba2); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
-        .config { display: flex; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; }
-        select, button { padding: 10px 16px; border-radius: 8px; border: none; font-size: 14px; cursor: pointer; }
-        select { background: #1a1a2e; color: #fff; border: 1px solid #333; min-width: 150px; }
-        button { background: linear-gradient(135deg, #667eea, #764ba2); color: #fff; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f0f1a; color: #fff; min-height: 100vh; }
+        .container { max-width: 900px; margin: 0 auto; padding: 16px; }
+        header { display: flex; justify-content: space-between; align-items: center; padding: 16px 0; border-bottom: 1px solid #333; margin-bottom: 16px; flex-wrap: wrap; gap: 12px; }
+        h1 { font-size: 20px; background: linear-gradient(135deg, #667eea, #764ba2); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+        .config { display: flex; gap: 10px; margin-bottom: 16px; flex-wrap: wrap; align-items: center; }
+        select, button { padding: 8px 14px; border-radius: 8px; border: none; font-size: 14px; cursor: pointer; }
+        select { background: #1a1a2e; color: #fff; border: 1px solid #333; min-width: 120px; }
+        button { background: linear-gradient(135deg, #667eea, #764ba2); color: #fff; white-space: nowrap; }
         button:disabled { opacity: 0.5; cursor: not-allowed; }
         button.tool-btn { background: linear-gradient(135deg, #f59e0b, #d97706); }
-        .chat-box { background: #1a1a2e; border-radius: 12px; height: 450px; overflow-y: auto; padding: 20px; margin-bottom: 20px; }
-        .message { margin-bottom: 16px; padding: 12px 16px; border-radius: 12px; max-width: 85%; line-height: 1.6; word-break: break-word; white-space: pre-wrap; }
+        .chat-box { background: #1a1a2e; border-radius: 12px; height: calc(100vh - 280px); min-height: 300px; max-height: 500px; overflow-y: auto; padding: 16px; margin-bottom: 16px; }
+        .message { margin-bottom: 12px; padding: 10px 14px; border-radius: 12px; max-width: 85%; line-height: 1.6; word-break: break-word; white-space: pre-wrap; }
         .message.user { background: #667eea; margin-left: auto; }
         .message.assistant { background: #2d2d44; }
         .message.tool-call { background: #1e3a5f; border-left: 3px solid #3b82f6; }
         .message.tool-result { background: #1a2e1a; border-left: 3px solid #22c55e; font-size: 13px; }
-        .tool-call-box { background: #0f172a; padding: 10px 14px; border-radius: 8px; margin-bottom: 8px; }
+        .tool-call-box { background: #0f172a; padding: 8px 12px; border-radius: 8px; margin-bottom: 8px; }
         .tool-call-name { color: #3b82f6; font-weight: bold; }
-        .tool-call-args { background: #1e293b; padding: 8px; border-radius: 4px; margin-top: 6px; font-family: monospace; font-size: 12px; white-space: pre-wrap; color: #94a3b8; }
-        .tool-result-box { background: #14532d; padding: 10px 14px; border-radius: 8px; }
-        .tool-result-label { color: #22c55e; font-weight: bold; font-size: 12px; margin-bottom: 4px; }
-        .think-box { background: #252535; border-left: 3px solid #f59e0b; padding: 8px 12px; margin: 8px 0; border-radius: 0 6px 6px 0; font-size: 13px; color: #ccc; }
-        .think-label { display: block; font-size: 11px; color: #f59e0b; margin-bottom: 4px; font-weight: bold; }
-        .input-area { display: flex; gap: 12px; }
-        textarea { flex: 1; padding: 14px; border-radius: 12px; background: #1a1a2e; border: 1px solid #333; color: #fff; font-size: 14px; resize: none; min-height: 56px; }
+        .tool-call-args { background: #1e293b; padding: 6px; border-radius: 4px; margin-top: 4px; font-family: monospace; font-size: 11px; white-space: pre-wrap; color: #94a3b8; overflow-x: auto; }
+        .tool-result-box { background: #14532d; padding: 8px 12px; border-radius: 8px; }
+        .tool-result-label { color: #22c55e; font-weight: bold; font-size: 11px; margin-bottom: 4px; }
+        .think-box { background: #252535; border-left: 3px solid #f59e0b; padding: 6px 10px; margin: 6px 0; border-radius: 0 6px 6px 0; font-size: 12px; color: #ccc; }
+        .think-label { display: block; font-size: 10px; color: #f59e0b; margin-bottom: 2px; font-weight: bold; }
+        .input-area { display: flex; gap: 10px; align-items: flex-end; }
+        textarea { flex: 1; padding: 12px; border-radius: 12px; background: #1a1a2e; border: 1px solid #333; color: #fff; font-size: 14px; resize: none; min-height: 48px; max-height: 150px; }
         textarea:focus { outline: none; border-color: #667eea; }
-        .loading { display: inline-block; width: 18px; height: 18px; border: 2px solid #fff; border-top-color: transparent; border-radius: 50%; animation: spin 0.8s linear infinite; }
+        .send-btn { min-width: 70px; height: 48px; }
+        .loading { display: inline-block; width: 16px; height: 16px; border: 2px solid #fff; border-top-color: transparent; border-radius: 50%; animation: spin 0.8s linear infinite; }
         @keyframes spin { to { transform: rotate(360deg); } }
-        .status { font-size: 12px; color: #888; margin-top: 10px; min-height: 18px; }
-        .tools-panel { background: #1a1a2e; border-radius: 12px; padding: 16px; margin-bottom: 20px; }
-        .tools-panel h3 { font-size: 14px; margin-bottom: 12px; color: #888; }
+        .status { font-size: 12px; color: #888; margin-top: 8px; min-height: 18px; }
+        .tools-panel { background: #1a1a2e; border-radius: 12px; padding: 14px; margin-bottom: 16px; }
+        .tools-panel h3 { font-size: 13px; margin-bottom: 10px; color: #888; }
         .tools-list { list-style: none; display: flex; flex-wrap: wrap; gap: 8px; }
-        .tool-item { background: #0f172a; padding: 8px 12px; border-radius: 6px; font-size: 12px; display: flex; align-items: center; gap: 6px; }
+        .tool-item { background: #0f172a; padding: 6px 10px; border-radius: 6px; font-size: 11px; display: flex; align-items: center; gap: 4px; }
         .tool-name { color: #3b82f6; font-weight: bold; }
-        .tool-desc { color: #64748b; }
+        .tool-desc { color: #64748b; display: none; }
+        
+        /* 移动端适配 */
+        @media (max-width: 768px) {
+            .container { padding: 12px; }
+            h1 { font-size: 18px; }
+            header { padding: 12px 0; }
+            .config { gap: 8px; }
+            select, button { padding: 8px 10px; font-size: 13px; }
+            select { min-width: 100px; }
+            .chat-box { 
+                height: calc(100vh - 320px); 
+                min-height: 250px;
+                padding: 12px;
+                border-radius: 8px;
+            }
+            .message { max-width: 92%; padding: 8px 12px; }
+            .tool-call-args { font-size: 10px; }
+            .input-area { gap: 8px; }
+            textarea { padding: 10px; min-height: 44px; font-size: 14px; }
+            .send-btn { min-width: 60px; height: 44px; padding: 8px 12px; }
+            .tools-panel { padding: 10px; }
+        }
+        
+        /* 小屏幕手机 */
+        @media (max-width: 480px) {
+            .container { padding: 8px; }
+            header { flex-direction: column; align-items: stretch; gap: 8px; }
+            h1 { text-align: center; font-size: 16px; }
+            .config { justify-content: center; }
+            .config select, .config button { flex: 1; min-width: 0; }
+            .chat-box { 
+                height: calc(100vh - 360px); 
+                border-radius: 6px;
+            }
+            .message { max-width: 95%; font-size: 13px; }
+            .think-box { font-size: 11px; padding: 4px 8px; }
+            .tools-panel h3 { font-size: 12px; }
+            .tool-item { font-size: 10px; padding: 4px 8px; }
+            textarea { font-size: 14px; }
+        }
     </style>
 </head>
 <body>
@@ -783,15 +959,27 @@ function serveIndex($response, $tools)
                                     if (!assistantMsgDiv) {
                                         assistantMsgDiv = addMsg("assistant", fullContent);
                                     } else {
-                                        if (fullContent.indexOf("<think>") !== -1) {
-                                            var parts = fullContent.split(/(<think>[\s\S]*?<\/think>)/);
-                                            var html = parts.map(function(part) {
-                                                if (part.indexOf("<think>") === 0) {
-                                                    var thinkContent = part.replace(/<\/?think>/g, "");
-                                                    return "<div class=\"think-box\"><span class=\"think-label\">Thinking...</span>" + escapeHtml(thinkContent) + "</div>";
-                                                }
-                                                return escapeHtml(part).replace(/\n/g, "<br>");
-                                            }).join("");
+                                        // 检查是否有完整的 think 标签
+                                        var thinkMatch = fullContent.match(/<think>([\s\S]*?)<\/think>/);
+                                        if (thinkMatch) {
+                                            // 有 think 标签，分别渲染
+                                            var beforeThink = fullContent.split("<think>")[0];
+                                            var afterThink = fullContent.split("</think>")[1] || "";
+                                            var thinkContent = thinkMatch[1];
+                                            
+                                            var html = "";
+                                            // 渲染 think 前的内容
+                                            if (beforeThink.trim()) {
+                                                html += escapeHtml(beforeThink).replace(/\n/g, "<br>");
+                                            }
+                                            // 只有 think 内容非空才显示盒子
+                                            if (thinkContent.trim()) {
+                                                html += "<div class=\"think-box\"><span class=\"think-label\">Thinking...</span>" + escapeHtml(thinkContent) + "</div>";
+                                            }
+                                            // 渲染 think 后的内容
+                                            if (afterThink.trim()) {
+                                                html += escapeHtml(afterThink).replace(/\n/g, "<br>");
+                                            }
                                             assistantMsgDiv.innerHTML = html;
                                         } else {
                                             assistantMsgDiv.innerHTML = escapeHtml(fullContent).replace(/\n/g, "<br>");
