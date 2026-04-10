@@ -65,6 +65,7 @@ AI Gateway - Ollama & vLLM Tool Calling 前端
 | 端点 | 方法 | 描述 |
 |------|------|------|
 | `/` | GET | 返回前端页面 |
+| `/functions` | GET | 函数搜索页面 |
 | `/api/chat/stream` | POST | 流式聊天接口 |
 | `/api/models` | GET | 获取模型列表 |
 | `/api/tools` | GET | 获取工具列表 |
@@ -224,3 +225,14 @@ return [
 - **问题**: 工具描述中的 `</script>` 等字符破坏 HTML 结构
 - **修复**: 使用 `JSON_HEX_TAG` 转义 JSON 中的 `<` 和 `>`，使用 `htmlspecialchars` 转义其他 HTML 特殊字符
 - **修复日期**: 2026-04-10
+
+### 10.4 Tools 开关关闭后仍调用函数
+- **问题**: 关闭 Tools 开关后，函数调用仍然被触发
+- **原因**: `$selectedTools` 初始值设为 `$tools`，未检查 `$streamTools` 状态
+- **修复**: 当 `$streamTools` 为 false 时，`$selectedTools` 设为空数组
+- **修复日期**: 2026-04-10
+
+### 10.5 新增函数搜索页面
+- **功能**: 添加 `/functions` 页面，支持 Qdrant 向量检索
+- **内容**: 搜索框检索相关函数、显示所有可用函数列表
+- **添加日期**: 2026-04-10

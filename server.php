@@ -82,6 +82,10 @@ $http->on('Request', function ($request, $response) use ($tools) {
                 // 测试检索
                 handleQdrantSearch($request, $response);
                 break;
+            case '/functions':
+                // Qdrant 函数搜索页面
+                serveFunctionsPage($response, $tools);
+                break;
             case '/health':
                 $response->end(json_encode([
                     'status' => 'ok',
@@ -133,32 +137,43 @@ function handleStreamChat($request, $response)
     $provider = isset($data['provider']) ? $data['provider'] : 'ollama';
     $model = isset($data['model']) ? $data['model'] : 'llama3.2';
     $messages = $data['messages'];
-    $streamTools = isset($data['tools']) ? $data['tools'] : true;
+    $streamTools = isset($data['tools']) ? (bool)$data['tools'] : true;
     
-    // 如果启用了 Qdrant 且可用，从用户消息中检索相关函数
-    $selectedTools = $tools;
-    if ($qdrantAvailable && $streamTools) {
-        // 获取用户最新的消息
-        $userQuery = '';
-        for ($i = count($messages) - 1; $i >= 0; $i--) {
-            if (isset($messages[$i]['role']) && $messages[$i]['role'] === 'user') {
-                $userQuery = $messages[$i]['content'];
-                break;
-            }
-        }
-        
-        if ($userQuery) {
-            try {
-                $retrievedTools = retrieveRelevantFunctions($userQuery, MAX_RETRIEVE_TOOLS);
-                if (!empty($retrievedTools)) {
-                    $selectedTools = array_column($retrievedTools, 'definition');
-                    // 发送检索信息给前端
-                    $retrievedNames = implode(', ', array_column($retrievedTools, 'name'));
-                    error_log("Qdrant retrieved: {$retrievedNames} for query: " . substr($userQuery, 0, 100));
+    // 如果工具开关关闭，不传递任何工具
+    $selectedTools = [];
+    if ($streamTools) {
+        // 如果启用了 Qdrant 且可用，从用户消息中检索相关函数
+        if ($qdrantAvailable) {
+            // 获取用户最新的消息
+            $userQuery = '';
+            for ($i = count($messages) - 1; $i >= 0; $i--) {
+                if (isset($messages[$i]['role']) && $messages[$i]['role'] === 'user') {
+                    $userQuery = $messages[$i]['content'];
+                    break;
                 }
-            } catch (Exception $e) {
-                error_log("Qdrant retrieve failed: " . $e->getMessage());
             }
+            
+            if ($userQuery) {
+                try {
+                    $retrievedTools = retrieveRelevantFunctions($userQuery, MAX_RETRIEVE_TOOLS);
+                    if (!empty($retrievedTools)) {
+                        $selectedTools = array_column($retrievedTools, 'definition');
+                        $retrievedNames = implode(', ', array_column($retrievedTools, 'name'));
+                        error_log("Qdrant retrieved: {$retrievedNames}");
+                    } else {
+                        // Qdrant 没有检索到结果，使用所有工具作为后备
+                        $selectedTools = $tools;
+                    }
+                } catch (Exception $e) {
+                    error_log("Qdrant retrieve failed: " . $e->getMessage());
+                    $selectedTools = $tools;
+                }
+            } else {
+                $selectedTools = $tools;
+            }
+        } else {
+            // 没有启用 Qdrant，使用所有工具
+            $selectedTools = $tools;
         }
     }
     
@@ -175,8 +190,8 @@ function handleStreamChat($request, $response)
 
 function streamOllamaWithTools($response, $model, $messages, $selectedTools, $allTools)
 {
-    // 如果有检索到的工具，使用检索结果；否则使用所有工具
-    $useTools = !empty($selectedTools) ? $selectedTools : $allTools;
+    // 如果用户关闭了工具开关 ($selectedTools 为空)，不传递任何工具
+    $activeTools = !empty($selectedTools) ? $selectedTools : [];
     
     $ollamaMessages = [];
     foreach ($messages as $m) {
@@ -202,7 +217,6 @@ function streamOllamaWithTools($response, $model, $messages, $selectedTools, $al
         }
     }
     
-    $activeTools = is_array($useTools) ? $useTools : [];
     $maxIterations = 10;
     $iteration = 0;
     $usedTools = [];
@@ -368,8 +382,8 @@ function streamOllamaWithTools($response, $model, $messages, $selectedTools, $al
 
 function streamVLLMWithTools($response, $model, $messages, $selectedTools, $allTools)
 {
-    // 如果有检索到的工具，使用检索结果；否则使用所有工具
-    $useTools = !empty($selectedTools) ? $selectedTools : $allTools;
+    // 如果用户关闭了工具开关 ($selectedTools 为空)，不传递任何工具
+    $activeTools = !empty($selectedTools) ? $selectedTools : [];
     
     $prompt = '';
     foreach ($messages as $msg) {
@@ -396,7 +410,7 @@ function streamVLLMWithTools($response, $model, $messages, $selectedTools, $allT
         'prompt' => $prompt,
         'stream' => true,
         'max_tokens' => 4096,
-        'tools' => is_array($useTools) ? $useTools : [],
+        'tools' => $activeTools,
     ]);
     
     $ch = curl_init(VLLM_URL . '/v1/completions');
@@ -641,6 +655,219 @@ function handleQdrantSearch($request, $response)
     }
 }
 
+/**
+ * 函数搜索页面
+ */
+function serveFunctionsPage($response, $tools)
+{
+    global $qdrantAvailable;
+    
+    $toolsJson = json_encode($tools, JSON_UNESCAPED_UNICODE | JSON_HEX_TAG);
+    $qdrantStatus = $qdrantAvailable ? 'true' : 'false';
+    
+    $html = '<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Function Search - AI Gateway</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f0f1a; color: #fff; min-height: 100vh; }
+        .container { max-width: 1000px; margin: 0 auto; padding: 20px; }
+        header { display: flex; justify-content: space-between; align-items: center; padding: 16px 0; border-bottom: 1px solid #333; margin-bottom: 24px; flex-wrap: wrap; gap: 12px; }
+        h1 { font-size: 20px; background: linear-gradient(135deg, #667eea, #764ba2); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+        .nav-links { display: flex; gap: 16px; }
+        .nav-links a { color: #667eea; text-decoration: none; font-size: 14px; }
+        .nav-links a:hover { text-decoration: underline; }
+        
+        .search-section { background: #1a1a2e; border-radius: 12px; padding: 20px; margin-bottom: 24px; }
+        .search-section h2 { font-size: 16px; margin-bottom: 16px; color: #888; }
+        .search-box { display: flex; gap: 12px; }
+        .search-box input { flex: 1; padding: 14px 18px; border-radius: 10px; background: #0f172a; border: 1px solid #333; color: #fff; font-size: 15px; }
+        .search-box input:focus { outline: none; border-color: #667eea; }
+        .search-box button { padding: 14px 28px; border-radius: 10px; background: linear-gradient(135deg, #667eea, #764ba2); border: none; color: #fff; font-size: 15px; cursor: pointer; }
+        .search-box button:hover { opacity: 0.9; }
+        .search-box button:disabled { opacity: 0.5; cursor: not-allowed; }
+        
+        .status { margin-top: 12px; font-size: 13px; color: #888; }
+        .status.error { color: #ef4444; }
+        .status.success { color: #22c55e; }
+        
+        .results-section { background: #1a1a2e; border-radius: 12px; padding: 20px; }
+        .results-section h2 { font-size: 16px; margin-bottom: 16px; color: #888; }
+        .result-item { background: #0f172a; border-radius: 10px; padding: 16px; margin-bottom: 12px; border-left: 3px solid #667eea; }
+        .result-item:last-child { margin-bottom: 0; }
+        .result-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+        .result-name { color: #667eea; font-weight: bold; font-size: 15px; }
+        .result-score { background: #1e3a5f; padding: 4px 10px; border-radius: 20px; font-size: 12px; color: #3b82f6; }
+        .result-desc { color: #94a3b8; font-size: 14px; margin-bottom: 10px; line-height: 1.5; }
+        .result-params { background: #1e293b; padding: 10px 14px; border-radius: 6px; font-family: monospace; font-size: 12px; color: #86efac; }
+        .result-params-title { color: #64748b; font-size: 11px; margin-bottom: 6px; }
+        
+        .empty-state { text-align: center; padding: 60px 20px; color: #64748b; }
+        .empty-state-icon { font-size: 48px; margin-bottom: 16px; }
+        .empty-state-text { font-size: 14px; }
+        
+        .tools-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; margin-top: 24px; }
+        .tool-card { background: #0f172a; border-radius: 10px; padding: 14px; border-left: 3px solid #22c55e; }
+        .tool-card h3 { color: #22c55e; font-size: 14px; margin-bottom: 6px; }
+        .tool-card p { color: #64748b; font-size: 12px; line-height: 1.4; }
+        
+        @media (max-width: 768px) {
+            .container { padding: 12px; }
+            .search-box { flex-direction: column; }
+            .tools-grid { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Function Search</h1>
+            <div class="nav-links">
+                <a href="/">Chat</a>
+                <a href="/functions">Functions</a>
+            </div>
+        </header>
+        
+        <div class="search-section">
+            <h2>Search Functions</h2>
+            <div class="search-box">
+                <input type="text" id="queryInput" placeholder="Enter your query (e.g., weather, calculate, time)..." onkeypress="if(event.key===\'Enter\')search()">
+                <button id="searchBtn" onclick="search()">Search</button>
+            </div>
+            <div class="status" id="status"></div>
+        </div>
+        
+        <div class="results-section">
+            <h2>Search Results</h2>
+            <div id="results">
+                <div class="empty-state">
+                    <div class="empty-state-icon">&#128269;</div>
+                    <div class="empty-state-text">Enter a query to search for relevant functions</div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="results-section" style="margin-top: 20px;">
+            <h2>All Available Functions</h2>
+            <div class="tools-grid" id="allTools"></div>
+        </div>
+    </div>
+
+    <script>
+        var allTools = " . $toolsJson . ";
+        var qdrantAvailable = " . $qdrantStatus . ";
+        
+        function escapeHtml(text) {
+            var div = document.createElement("div");
+            div.textContent = text;
+            return div.innerHTML;
+        }
+        
+        function renderTools() {
+            var container = document.getElementById("allTools");
+            var html = "";
+            for (var i = 0; i < allTools.length; i++) {
+                var tool = allTools[i].function;
+                html += \'<div class="tool-card">\';
+                html += \'<h3>\' + escapeHtml(tool.name) + \'</h3>\';
+                html += \'<p>\' + escapeHtml(tool.description) + \'</p>\';
+                html += \'</div>\';
+            }
+            if (html === "") {
+                html = \'<div class="empty-state"><div class="empty-state-icon">&#9888;</div><div class="empty-state-text">No functions available</div></div>\';
+            }
+            container.innerHTML = html;
+        }
+        
+        function search() {
+            var query = document.getElementById("queryInput").value.trim();
+            if (!query) return;
+            
+            var btn = document.getElementById("searchBtn");
+            var status = document.getElementById("status");
+            var results = document.getElementById("results");
+            
+            btn.disabled = true;
+            status.textContent = "Searching...";
+            status.className = "status";
+            
+            fetch("/api/qdrant/search", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ query: query, limit: 5 })
+            })
+            .then(function(res) { return res.json(); })
+            .then(function(data) {
+                btn.disabled = false;
+                
+                if (!data.success) {
+                    status.textContent = "Search failed: " + (data.error || "Unknown error");
+                    status.className = "status error";
+                    return;
+                }
+                
+                status.textContent = "Found " + data.results.length + " functions (Qdrant: " + qdrantAvailable + ")";
+                status.className = "status success";
+                
+                if (data.results.length === 0) {
+                    results.innerHTML = \'<div class="empty-state"><div class="empty-state-icon">&#128269;</div><div class="empty-state-text">No matching functions found</div></div>\';
+                    return;
+                }
+                
+                var html = "";
+                for (var i = 0; i < data.results.length; i++) {
+                    var item = data.results[i];
+                    var func = item.definition.function;
+                    var score = (item.score * 100).toFixed(1);
+                    
+                    html += \'<div class="result-item">\';
+                    html += \'<div class="result-header">\';
+                    html += \'<span class="result-name">\' + escapeHtml(func.name) + \'</span>\';
+                    html += \'<span class="result-score">\' + score + \'% match</span>\';
+                    html += \'</div>\';
+                    html += \'<div class="result-desc">\' + escapeHtml(func.description) + \'</div>\';
+                    
+                    if (func.parameters && func.parameters.properties) {
+                        var params = func.parameters;
+                        var required = params.required || [];
+                        var paramList = [];
+                        
+                        for (var pname in params.properties) {
+                            var p = params.properties[pname];
+                            var req = required.indexOf(pname) !== -1 ? "(required)" : "(optional)";
+                            paramList.push(escapeHtml(pname) + ": " + escapeHtml(p.type || "any") + " " + req);
+                        }
+                        
+                        if (paramList.length > 0) {
+                            html += \'<div class="result-params-title">Parameters:</div>\';
+                            html += \'<div class="result-params">\' + paramList.join("\\n") + \'</div>\';
+                        }
+                    }
+                    
+                    html += \'</div>\';
+                }
+                
+                results.innerHTML = html;
+            })
+            .catch(function(e) {
+                btn.disabled = false;
+                status.textContent = "Error: " + e.message;
+                status.className = "status error";
+            });
+        }
+        
+        renderTools();
+    </script>
+</body>
+</html>';
+    
+    $response->header('Content-Type', 'text/html; charset=utf-8');
+    $response->end($html);
+}
+
 function serveIndex($response, $tools)
 {
     // 使用 JSON_HEX_TAG 转义 < 和 >，防止 </script> 等破坏 HTML
@@ -685,8 +912,14 @@ function serveIndex($response, $tools)
         .tool-call-args { background: #1e293b; padding: 6px; border-radius: 4px; margin-top: 4px; font-family: monospace; font-size: 11px; white-space: pre-wrap; color: #94a3b8; overflow-x: auto; }
         .tool-result-box { background: #14532d; padding: 8px 12px; border-radius: 8px; }
         .tool-result-label { color: #22c55e; font-weight: bold; font-size: 11px; margin-bottom: 4px; }
-        .think-box { background: #252535; border-left: 3px solid #f59e0b; padding: 6px 10px; margin: 6px 0; border-radius: 0 6px 6px 0; font-size: 12px; color: #ccc; }
-        .think-label { display: block; font-size: 10px; color: #f59e0b; margin-bottom: 2px; font-weight: bold; }
+        .think-box { background: #1e2433; border: 1px solid #3b4566; border-left: 3px solid #f59e0b; padding: 8px 12px; margin: 8px 0; border-radius: 6px; font-size: 12px; color: #a0aec0; cursor: pointer; transition: all 0.2s; }
+        .think-box:hover { border-color: #f59e0b; background: #252b3d; }
+        .think-box.collapsed .think-content { display: none; }
+        .think-label { display: flex; align-items: center; gap: 6px; font-size: 11px; color: #f59e0b; font-weight: 600; }
+        .think-label::before { content: "🤔"; font-size: 14px; }
+        .think-label::after { content: "▼"; font-size: 10px; margin-left: auto; transition: transform 0.2s; }
+        .think-box.collapsed .think-label::after { transform: rotate(-90deg); }
+        .think-content { margin-top: 8px; padding-top: 8px; border-top: 1px dashed #3b4566; white-space: pre-wrap; line-height: 1.5; max-height: 300px; overflow-y: auto; }
         .input-area { display: flex; gap: 10px; align-items: flex-end; }
         textarea { flex: 1; padding: 12px; border-radius: 12px; background: #1a1a2e; border: 1px solid #333; color: #fff; font-size: 14px; resize: none; min-height: 48px; max-height: 150px; }
         textarea:focus { outline: none; border-color: #667eea; }
@@ -783,7 +1016,7 @@ function serveIndex($response, $tools)
         var loading = false;
         var useTools = true;
         
-        var tools = ' . $toolsJson . ';
+        var tools = " . $toolsJson . ";
 
         function loadModels() {
             status.textContent = "Loading models...";
@@ -962,27 +1195,29 @@ function serveIndex($response, $tools)
                                         // 检查是否有完整的 think 标签
                                         var thinkMatch = fullContent.match(/<think>([\s\S]*?)<\/think>/);
                                         if (thinkMatch) {
-                                            // 有 think 标签，分别渲染
-                                            var beforeThink = fullContent.split("<think>")[0];
+                                            // 有 think 标签，只显示 think 盒子里的内容
                                             var afterThink = fullContent.split("</think>")[1] || "";
                                             var thinkContent = thinkMatch[1];
                                             
                                             var html = "";
-                                            // 渲染 think 前的内容
-                                            if (beforeThink.trim()) {
-                                                html += escapeHtml(beforeThink).replace(/\n/g, "<br>");
-                                            }
-                                            // 只有 think 内容非空才显示盒子
+                                            // 只有 think 内容非空才显示盒子（可折叠）
                                             if (thinkContent.trim()) {
-                                                html += "<div class=\"think-box\"><span class=\"think-label\">Thinking...</span>" + escapeHtml(thinkContent) + "</div>";
+                                                html += "<div class=\"think-box\" onclick=\"this.classList.toggle(\'collapsed\')\">" +
+                                                    "<span class=\"think-label\">Thinking</span>" +
+                                                    "<div class=\"think-content\">" + escapeHtml(thinkContent) + "</div></div>";
                                             }
-                                            // 渲染 think 后的内容
+                                            // 渲染 think 后的内容（去除开头换行，合并多余换行）
                                             if (afterThink.trim()) {
-                                                html += escapeHtml(afterThink).replace(/\n/g, "<br>");
+                                                var cleanAfter = afterThink.replace(/^\n+/, "").replace(/\n{2,}/g, "\n");
+                                                if (cleanAfter.trim()) {
+                                                    html += escapeHtml(cleanAfter).replace(/\n/g, "<br>");
+                                                }
                                             }
                                             assistantMsgDiv.innerHTML = html;
                                         } else {
-                                            assistantMsgDiv.innerHTML = escapeHtml(fullContent).replace(/\n/g, "<br>");
+                                            // 没有 think 标签：去除开头换行，合并连续换行
+                                            var cleanContent = fullContent.replace(/^\n+/, "").replace(/\n{2,}/g, "\n");
+                                            assistantMsgDiv.innerHTML = escapeHtml(cleanContent).replace(/\n/g, "<br>");
                                         }
                                         chatBox.scrollTop = chatBox.scrollHeight;
                                     }

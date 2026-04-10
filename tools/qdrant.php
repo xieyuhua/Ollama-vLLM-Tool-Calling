@@ -301,5 +301,5 @@ function getFunctionVectorStore() {
  */
 function retrieveRelevantFunctions($query, $limit = 3) {
     $store = getFunctionVectorStore();
-    return $store->retrieveFunctions($query, $limit, 0.3);
+    return $store->retrieveFunctions($query, $limit, 0.4);
 }
