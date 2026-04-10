@@ -1,0 +1,4 @@
+qdrant/storage
+qdrant/snapshots
+logs/
+bin/

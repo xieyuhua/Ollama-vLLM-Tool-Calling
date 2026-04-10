@@ -136,7 +136,7 @@ function handleStreamChat($request, $response)
         $role = $m['role'] ?? 'unknown';
         $hasToolCalls = isset($m['tool_calls']) ? 'yes' : 'no';
         $content = isset($m['content']) ? substr($m['content'], 0, 50) : '';
-        error_log("msg[$i] role=$role tool_calls=$hasToolCalls content=$content");
+        // error_log("msg[$i] role=$role tool_calls=$hasToolCalls content=$content");
     }
     
     if (!$data || !isset($data['messages'])) {
@@ -170,13 +170,13 @@ function handleStreamChat($request, $response)
                     if (!empty($retrievedTools)) {
                         $selectedTools = array_column($retrievedTools, 'definition');
                         $retrievedNames = implode(', ', array_column($retrievedTools, 'name'));
-                        error_log("Qdrant retrieved: {$retrievedNames}");
+                        error_log(date('Y-m-d H:i:s').' '."Qdrant retrieved: {$retrievedNames}");
                     } else {
                         // Qdrant 没有检索到结果，使用所有工具作为后备
                         $selectedTools = $tools;
                     }
                 } catch (Exception $e) {
-                    error_log("Qdrant retrieve failed: " . $e->getMessage());
+                    error_log(date('Y-m-d H:i:s').' '."Qdrant retrieve failed: " . $e->getMessage());
                     $selectedTools = $tools;
                 }
             } else {
@@ -245,7 +245,7 @@ function streamOllamaWithTools($response, $model, $messages, $selectedTools, $al
         $role = $m['role'] ?? 'unknown';
         $hasToolCalls = isset($m['tool_calls']) ? 'yes' : 'no';
         $content = isset($m['content']) ? substr($m['content'], 0, 100) : '';
-        error_log("ollamaMsg[$i] role=$role tool_calls=$hasToolCalls content=$content");
+        // error_log("ollamaMsg[$i] role=$role tool_calls=$hasToolCalls content=$content");
     }
     
     $maxIterations = 10;
