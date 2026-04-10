@@ -128,6 +128,17 @@ function handleStreamChat($request, $response)
     
     $data = json_decode($request->getContent(), true);
     
+    // 调试日志
+    error_log("=== Chat Request ===");
+    error_log("tools enabled: " . ($data['tools'] ?? 'not set'));
+    error_log("messages count: " . count($data['messages'] ?? []));
+    foreach ($data['messages'] ?? [] as $i => $m) {
+        $role = $m['role'] ?? 'unknown';
+        $hasToolCalls = isset($m['tool_calls']) ? 'yes' : 'no';
+        $content = isset($m['content']) ? substr($m['content'], 0, 50) : '';
+        error_log("msg[$i] role=$role tool_calls=$hasToolCalls content=$content");
+    }
+    
     if (!$data || !isset($data['messages'])) {
         $response->status(400);
         $response->end(json_encode(['error' => 'Invalid request']));
@@ -198,23 +209,43 @@ function streamOllamaWithTools($response, $model, $messages, $selectedTools, $al
         $role = isset($m['role']) ? $m['role'] : 'user';
         $content = isset($m['content']) ? $m['content'] : '';
         
-        if ($role === 'tool' && isset($m['name'])) {
-            $ollamaMessages[] = [
-                'role' => 'tool',
-                'content' => is_string($m['content']) ? $m['content'] : json_encode($m['content']),
-                'name' => $m['name']
-            ];
-        } elseif ($role === 'tool') {
-            $ollamaMessages[] = [
+        if ($role === 'tool') {
+            // 工具结果消息
+            $toolMsg = [
                 'role' => 'tool',
                 'content' => is_string($m['content']) ? $m['content'] : json_encode($m['content'])
             ];
+            if (isset($m['name'])) {
+                $toolMsg['name'] = $m['name'];
+            }
+            if (isset($m['tool_call_id'])) {
+                $toolMsg['tool_call_id'] = $m['tool_call_id'];
+            }
+            $ollamaMessages[] = $toolMsg;
+        } elseif (isset($m['tool_calls']) && !empty($m['tool_calls'])) {
+            // 带有工具调用的 assistant 消息
+            $ollamaMessages[] = [
+                'role' => 'assistant',
+                'content' => $content ?: '',
+                'tool_calls' => $m['tool_calls']
+            ];
         } else {
+            // 普通消息
             $ollamaMessages[] = [
                 'role' => $role,
                 'content' => $content
             ];
         }
+    }
+    
+    // 调试日志
+    error_log("=== Ollama Messages ===");
+    error_log("activeTools count: " . count($activeTools));
+    foreach ($ollamaMessages as $i => $m) {
+        $role = $m['role'] ?? 'unknown';
+        $hasToolCalls = isset($m['tool_calls']) ? 'yes' : 'no';
+        $content = isset($m['content']) ? substr($m['content'], 0, 100) : '';
+        error_log("ollamaMsg[$i] role=$role tool_calls=$hasToolCalls content=$content");
     }
     
     $maxIterations = 10;
@@ -329,7 +360,7 @@ function streamOllamaWithTools($response, $model, $messages, $selectedTools, $al
             CURLOPT_TIMEOUT => 300,
         ]);
         
-        curl_exec($ch);
+        @curl_exec($ch);
         
         if (curl_errno($ch)) {
             $response->write("event: error\ndata: " . json_encode(['error' => curl_error($ch)]) . "\n\n");
@@ -1178,13 +1209,32 @@ function serveIndex($response, $tools)
                             try {
                                 var p = JSON.parse(data);
                                 
-                                if (p.type === "tool_call" && p.calls) {
+                                // 根据 event 类型或 p.type 处理事件
+                                if (event === "tool_call" || p.type === "tool_call") {
                                     // 显示工具调用
-                                    addToolCall(p.calls);
-                                    status.textContent = "执行工具中...";
-                                } else if (p.type === "tool_result") {
+                                    if (p.calls) {
+                                        addToolCall(p.calls);
+                                        // 将工具调用添加到消息历史（用于后续请求）
+                                        messages.push({
+                                            role: "assistant",
+                                            content: "",
+                                            tool_calls: p.calls
+                                        });
+                                        status.textContent = "执行工具中...";
+                                    }
+                                    event = ""; // 重置事件状态
+                                } else if (event === "tool_result" || p.type === "tool_result") {
                                     // 显示工具结果
-                                    addToolResult(p.result, p.result.success !== false);
+                                    if (p.result) {
+                                        addToolResult(p.result, p.result.success !== false);
+                                        // 将工具结果添加到消息历史（用于后续请求）
+                                        messages.push({
+                                            role: "tool",
+                                            content: JSON.stringify(p.result.result || p.result),
+                                            name: p.name
+                                        });
+                                    }
+                                    event = ""; // 重置事件状态
                                     status.textContent = "润色中...";
                                 } else if (p.type === "content") {
                                     // 流式显示内容
