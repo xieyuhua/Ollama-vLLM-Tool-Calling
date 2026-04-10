@@ -9,7 +9,7 @@ define('VLLM_URL', getenv('VLLM_URL') ?: 'http://localhost:8000');
 define('PORT', (int)(getenv('PORT') ?: 9501));
 define('USE_QDRANT', getenv('USE_QDRANT') !== 'false'); // 默认启用 Qdrant 检索
 define('MAX_RETRIEVE_TOOLS', 3); // 最多检索的工具数量
-
+define('VECTORSIZE', 1024);
 // 日志目录
 if (!is_dir(__DIR__ . '/logs')) {
     mkdir(__DIR__ . '/logs', 0755, true);
@@ -36,7 +36,7 @@ if (USE_QDRANT) {
         $qdrantAvailable = true;
         // 初始化向量索引
         $store = getFunctionVectorStore();
-        $store->initCollection();
+        $store->initCollection(VECTORSIZE);
     } catch (Exception $e) {
         error_log("Qdrant init failed: " . $e->getMessage());
     }

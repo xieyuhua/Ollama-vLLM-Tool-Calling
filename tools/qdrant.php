@@ -58,7 +58,7 @@ class QdrantClient {
     /**
      * 创建集合
      */
-    public function createCollection($name, $vectorSize = 768, $distance = 'Cosine') {
+    public function createCollection($name, $vectorSize = 1024, $distance = 'Cosine') {
         $data = [
             'vectors' => [
                 'size' => $vectorSize,
@@ -169,7 +169,7 @@ class FunctionVectorStore {
     /**
      * 初始化集合
      */
-    public function initCollection($vectorSize = 768) {
+    public function initCollection($vectorSize = 1024) {
         if (!$this->qdrant->collectionExists(QDRANT_COLLECTION)) {
             return $this->qdrant->createCollection(QDRANT_COLLECTION, $vectorSize);
         }
@@ -220,6 +220,7 @@ class FunctionVectorStore {
             // 生成向量
             $vector = $this->embedding->encode($text);
             if (!$vector) {
+                var_dump($vector);
                 error_log("Failed to embed function: {$name}");
                 continue;
             }
