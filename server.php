@@ -371,32 +371,10 @@ function streamOllamaWithTools($response, $model, $messages, $selectedTools, $al
         curl_close($ch);
         
         // 判断当前响应是否有工具调用
-        // 如果有工具调用，继续循环；如果没有，输出工具引用并结束
+        // 如果有工具调用，继续循环；如果没有，结束
         if (empty($hasToolCall)) {
-            // 没有工具调用，输出工具引用
-            if (!empty($usedTools)) {
-                $toolSummary = "\n\n" . str_repeat("─", 40) . "\n";
-                $toolSummary .= "**🔧 工具引用**\n";
-                
-                foreach ($usedTools as $idx => $tool) {
-                    $toolSummary .= "\n" . ($idx + 1) . ". **{$tool['name']}**\n";
-                    if (!empty($tool['args'])) {
-                        $toolSummary .= "   参数: `" . json_encode($tool['args'], JSON_UNESCAPED_UNICODE) . "`\n";
-                    }
-                    if (isset($tool['result']['result'])) {
-                        $resultStr = is_array($tool['result']['result']) 
-                            ? json_encode($tool['result']['result'], JSON_UNESCAPED_UNICODE)
-                            : $tool['result']['result'];
-                        $toolSummary .= "   结果: " . $resultStr . "\n";
-                    }
-                }
-                
-                $response->write("event: content\ndata: " . json_encode([
-                    'type' => 'content',
-                    'content' => $toolSummary
-                ]) . "\n\n");
-            }
-            
+            // 没有新的工具调用，结束
+            // 注意：工具调用和结果已在循环中通过 SSE 发送给前端，不需要额外输出摘要
             if ($fullContent) {
                 $ollamaMessages[] = ['role' => 'assistant', 'content' => $fullContent];
             }

@@ -9,7 +9,7 @@ define('QDRANT_HOST', getenv('QDRANT_HOST') ?: 'localhost');
 define('QDRANT_PORT', getenv('QDRANT_PORT') ?: 6333);
 define('QDRANT_COLLECTION', 'functions');
 define('EMBEDDING_URL', getenv('EMBEDDING_URL') ?: 'http://localhost:11434/api/embeddings');
-define('EMBEDDING_MODEL', getenv('EMBEDDING_MODEL') ?: 'nomic-embed-text');
+define('EMBEDDING_MODEL', getenv('EMBEDDING_MODEL') ?: 'bge-m3:latest');// Qwen3-Embedding (8B/4B/0.6B)
 
 /**
  * 获取向量化服务
